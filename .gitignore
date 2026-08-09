@@ -1,0 +1,14 @@
+# Credenciais de WiFi - nunca versionar
+secrets.h
+
+# Artefatos de build do Arduino IDE / arduino-cli
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini
