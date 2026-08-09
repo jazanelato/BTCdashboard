@@ -7,7 +7,7 @@
  * Layout:
  *   Coluna esquerda (0..103)  -> preco atual, variacao 24h e variacao do periodo
  *   Coluna direita  (106..249)-> grafico de linha do periodo selecionado
- *   Rodape (y 105..121)       -> relogio, fonte dos dados e RSSI
+ *   Rodape (y 105..121)       -> relogio, sinal WiFi e bateria (GPIO35)
  *
  * Botao GPIO39:
  *   clique curto   -> proximo periodo (1 dia, 1 semana, 1 mes, 6 meses, 1 ano, tudo)
@@ -52,6 +52,16 @@ const int   DST_OFFSET_S = 0;
 #define ELINK_RESET  16
 #define ELINK_DC     17
 #define BUTTON_PIN   39
+
+// ---------- Bateria ----------
+// O T5 v2.3 leva a bateria a GPIO35 (ADC1_CH7) por um divisor 1:2 (1M/1M).
+// ADC1, entao a leitura continua valendo com o WiFi ligado.
+// analogReadMilliVolts() ja aplica a calibracao de fabrica gravada na eFuse,
+// entao basta multiplicar pelo fator do divisor.
+#define BATT_PIN       35
+#define BATT_DIV       2.0f    // ajuste fino aqui se o multimetro discordar
+#define BATT_AMOSTRAS  16
+#define BATT_USB_V     4.25f   // acima disso e' alimentacao externa/carga
 
 // ---------- Painel ----------
 #define PANEL GxEPD2_213_BN
@@ -108,6 +118,49 @@ bool    okPrice   = false;
 bool    okHist    = false;
 bool    loading   = false;       // mostra "..." enquanto busca
 
+float   battVolts = 0.0f;
+uint8_t battPct   = 0;
+bool    battUsb   = false;
+
+// =====================================================================
+//  Bateria
+// =====================================================================
+
+// Curva de descarga de uma celula LiPo em repouso. Interpolar linearmente
+// entre 4.2 e 3.3 V erra feio: a celula passa metade da vida entre 3.9 e 3.7 V.
+const struct { float v; uint8_t p; } LIPO[] = {
+  { 4.20f, 100 }, { 4.10f, 90 }, { 4.00f, 80 }, { 3.93f, 70 },
+  { 3.87f,  60 }, { 3.82f, 50 }, { 3.79f, 40 }, { 3.77f, 30 },
+  { 3.74f,  20 }, { 3.68f, 10 }, { 3.45f,  5 }, { 3.30f,  0 }
+};
+const int LIPO_N = sizeof(LIPO) / sizeof(LIPO[0]);
+
+uint8_t lipoPct(float v) {
+  if (v >= LIPO[0].v)          return 100;
+  if (v <= LIPO[LIPO_N - 1].v) return 0;
+  for (int i = 0; i < LIPO_N - 1; i++) {
+    if (v <= LIPO[i].v && v > LIPO[i + 1].v) {
+      float f = (v - LIPO[i + 1].v) / (LIPO[i].v - LIPO[i + 1].v);
+      return LIPO[i + 1].p + f * (LIPO[i].p - LIPO[i + 1].p);
+    }
+  }
+  return 0;
+}
+
+// Media de varias leituras: o ADC do ESP32 e ruidoso e uma amostra so oscila
+// facil 50 mV, o que na parte plana da curva vale uns 8% de diferenca.
+void battLer() {
+  uint32_t somaMv = 0;
+  for (int i = 0; i < BATT_AMOSTRAS; i++) {
+    somaMv += analogReadMilliVolts(BATT_PIN);
+    delay(2);
+  }
+  battVolts = (somaMv / (float)BATT_AMOSTRAS) / 1000.0f * BATT_DIV;
+  battUsb   = (battVolts > BATT_USB_V);   // heuristica: no USB o pino fica ~4.3+
+  battPct   = lipoPct(battVolts);
+  Serial.printf("bateria %.2f V -> %d%%%s\n", battVolts, battPct, battUsb ? " (USB)" : "");
+}
+
 // ---------- Temporizacao ----------
 const uint32_t PRICE_MS = 60UL  * 1000UL;   // 1 min
 const uint32_t CHART_MS = 300UL * 1000UL;   // 5 min
@@ -147,6 +200,19 @@ void small(int x, int y, const char* s) {
 
 void smallRight(int xr, int y, const char* s) {
   small(xr - (int)strlen(s) * 6, y, s);
+}
+
+// Icone de pilha deitada, com o nivel proporcional a pct.
+// A cor vem de fora para o icone servir tanto em fundo branco quanto na
+// faixa preta do cabecalho.
+void iconeBateria(int x, int y, int w, int h, uint8_t pct, uint16_t cor) {
+  int corpo = w - 3;                       // sobra 3 px para o polo positivo
+  display.drawRect(x, y, corpo, h, cor);
+  display.fillRect(x + corpo, y + h / 3, 3, h - 2 * (h / 3), cor);
+
+  int util  = corpo - 4;
+  int cheio = (util * (pct > 100 ? 100 : pct)) / 100;
+  if (cheio > 0) display.fillRect(x + 2, y + 2, cheio, h - 4, cor);
 }
 
 // Rotulo pequeno com fundo branco (para escrever por cima do grafico)
@@ -410,10 +476,18 @@ void drawChart() {
 void drawFooterRight() {
   char b[32];
   display.drawFastHLine(COL_W, FOOT_Y, W - COL_W, GxEPD_BLACK);
-  small(CHART_X, 110, "Binance");
+
+  // Sinal do WiFi (RSSI em dBm: -50 otimo, -70 fraco, -85 comeca a cair)
   if (WiFi.status() == WL_CONNECTED) snprintf(b, sizeof(b), "%ddBm", WiFi.RSSI());
   else                               snprintf(b, sizeof(b), "sem wifi");
-  smallRight(W - 2, 110, b);
+  small(CHART_X, 110, b);
+
+  // Bateria no canto inferior direito: porcentagem + pilha
+  const int ICO_W = 24, ICO_H = 9, ICO_X = W - 2 - ICO_W, ICO_Y = 108;
+  iconeBateria(ICO_X, ICO_Y, ICO_W, ICO_H, battPct, GxEPD_BLACK);
+  if (battUsb) snprintf(b, sizeof(b), "USB");
+  else         snprintf(b, sizeof(b), "%d%%", battPct);
+  smallRight(ICO_X - 4, 110, b);
 }
 
 // Tela inteira
@@ -445,6 +519,7 @@ void drawPriceOnly() {
 // =====================================================================
 void updatePrice(bool full) {
   okPrice = fetchTicker();
+  battLer();
   if (full) drawAll(); else drawPriceOnly();
   tPrice = millis();
 }
@@ -452,6 +527,7 @@ void updatePrice(bool full) {
 void updateChart() {
   okHist  = fetchKlines();
   okPrice = fetchTicker();
+  battLer();
   drawAll();
   tChart = millis();
   tPrice = millis();
@@ -474,6 +550,10 @@ void setup() {
   Serial.println("\n=== BTC dashboard - T5 2.13\" / GxEPD2 ===");
 
   pinMode(BUTTON_PIN, INPUT);
+
+  // ADC da bateria: 11 dB cobre a faixa ate' ~2.5 V no pino (5 V na bateria)
+  analogSetPinAttenuation(BATT_PIN, ADC_11db);
+  battLer();
 
   // A GxEPD2 abre o SPI com os pinos padrao; refazemos com os da placa
   display.init(115200, true, 2, false);

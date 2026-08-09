@@ -6,7 +6,8 @@ tempo selecionáveis pelo botão da placa.
 
 ![Os seis períodos do gráfico](docs/preview.png)
 
-*Simulação do layout nos seis períodos (dados sintéticos, ampliado 2x).*
+*Simulação do layout nos seis períodos, com estados variados de bateria e sinal
+(dados sintéticos, ampliado 2x).*
 
 ## Funcionalidades
 
@@ -15,7 +16,8 @@ tempo selecionáveis pelo botão da placa.
 - Troca de período pelo botão da placa (GPIO39), sem recompilar
 - Variação percentual do período selecionado
 - Refresh **parcial** só na área do preço — rápido e com pouco ghosting
-- Relógio via NTP e indicador de sinal WiFi no rodapé
+- Indicador de bateria com porcentagem e ícone de pilha
+- Relógio via NTP e força do sinal WiFi no rodapé
 - Sem chave de API: usa os endpoints públicos da Binance
 
 ## Hardware
@@ -35,6 +37,7 @@ tempo selecionáveis pelo botão da placa.
 | RESET | 16 |
 | DC | 17 |
 | Botão | 39 |
+| Bateria (ADC) | 35 |
 
 Se o seu T5 usa outro painel (GDEM0213B74, GDEH0213B73, GxEPD2_213_flex), troque a
 linha `#define PANEL` no início do sketch.
@@ -119,7 +122,22 @@ parte do cabeçalho a cada atualização.
 **Regra prática para este painel em rotação 1:** `(122 − y)` e a altura precisam
 ser múltiplos de 8. A janela do preço usa `(0, 18, 104, 104)`, que fecha exato.
 
-### 2. Parser em streaming para os klines
+### 2. Porcentagem de bateria por tabela, não por regra de três
+
+A bateria chega ao **GPIO35** (ADC1, então continua funcionando com o WiFi
+ligado) por um divisor 1:2. A leitura usa `analogReadMilliVolts()`, que já aplica
+a calibração de fábrica gravada na eFuse — nada de fator empírico em cima do
+`analogRead()` cru. Como uma amostra isolada oscila uns 50 mV, o sketch tira a
+média de 16 leituras.
+
+Converter tensão em porcentagem de forma linear entre 4,2 e 3,3 V erra bastante:
+a célula LiPo passa metade da vida útil entre 3,9 e 3,7 V. O código interpola numa
+tabela de descarga (`LIPO[]`), o que dá um número bem mais próximo da realidade na
+região plana da curva.
+
+`BATT_DIV` é o ponto de ajuste fino se o multímetro discordar da leitura.
+
+### 3. Parser em streaming para os klines
 
 A resposta de `/klines` chega a ~55 KB no período de 1 dia. Carregar isso como
 String e jogar num parser de JSON compete por heap com o TLS e com o buffer do
@@ -136,6 +154,8 @@ consumo de RAM fica no array de floats, independente do tamanho da resposta.
 | Tela em branco ou com lixo | `#define PANEL` errado para o seu display. |
 | Parte do texto some no refresh parcial | Janela parcial desalinhada — veja a nota 1 acima. |
 | Erro de compilação em `GxEPD.h` | Está usando a biblioteca antiga; instale a GxEPD2. |
+| Bateria mostra `USB` sempre | Alimentação externa mantém o pino acima de 4,25 V — comportamento esperado com o cabo ligado. |
+| Porcentagem de bateria não bate com o multímetro | Ajuste `BATT_DIV` (padrão 2.0, do divisor 1M/1M). |
 
 ## Licença
 
